@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# PyTorch
+.ipynb_checkpoints/
+
+# Data
+data/
+multi30k/
+
+# Logs
+runs/
+
+# IDE
+.vscode/ 
