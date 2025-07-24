@@ -20,13 +20,23 @@ LANGUAGE_PAIR = 'de-en'
 SRC_LANGUAGE = 'de'  # 德语
 TGT_LANGUAGE = 'en'  # 英语
 
-# 数据路径配置 - 使用Hugging Face缓存的WMT14数据
+# 数据路径配置 - AutoDL服务器适配
 USE_HUGGINGFACE_DATASETS = True  # 使用HF datasets而非本地文件
-RAW_DATA_DIR = None  # 自动使用Hugging Face默认缓存路径
-HUGGINGFACE_CACHE_DIR = None  # 自动使用Hugging Face默认缓存路径
-PREPARED_DATA_DIR = "data_bpe_original"  # BPE处理后的数据
-CHECKPOINTS_DIR = "checkpoints"
-LOGS_DIR = "logs"
+
+# AutoDL服务器路径配置（数据盘存储，避免系统盘空间不足）
+if os.path.exists('/root/autodl-tmp'):  # AutoDL环境检测
+    BASE_DIR = '/root/autodl-tmp/MyFirstTransformer'
+    RAW_DATA_DIR = None  # 自动使用Hugging Face默认缓存路径
+    HUGGINGFACE_CACHE_DIR = '/root/autodl-tmp/.cache/huggingface'  # HF缓存到数据盘
+    PREPARED_DATA_DIR = f"{BASE_DIR}/data_bpe_original"  # BPE处理后的数据
+    CHECKPOINTS_DIR = f"{BASE_DIR}/checkpoints"  # 检查点存储到数据盘
+    LOGS_DIR = f"{BASE_DIR}/logs"  # 日志存储到数据盘
+else:  # 本地开发环境
+    RAW_DATA_DIR = None  # 自动使用Hugging Face默认缓存路径
+    HUGGINGFACE_CACHE_DIR = None  # 自动使用Hugging Face默认缓存路径
+    PREPARED_DATA_DIR = "data_bpe_original"  # BPE处理后的数据
+    CHECKPOINTS_DIR = "checkpoints"
+    LOGS_DIR = "logs"
 
 # 确保目录存在
 for dir_path in [PREPARED_DATA_DIR, CHECKPOINTS_DIR, LOGS_DIR]:
@@ -169,22 +179,40 @@ NUM_WORKERS = 8            # 服务器优化：使用8个worker（避免过多�
 # =============================================================================
 
 # --- 模型文件路径 ---
-BEST_MODEL_PATH = f"{CHECKPOINTS_DIR}/{BEST_MODEL_NAME}"
-LATEST_MODEL_PATH = f"{CHECKPOINTS_DIR}/{LATEST_MODEL_NAME}"
-BPE_MODEL_PATH = f"{PREPARED_DATA_DIR}/tokenizer.json"  # 使用Hugging Face格式
-BPE_VOCAB_PATH = f"{PREPARED_DATA_DIR}/vocab.json"
-
-# SentencePiece模型路径 (用于BLEU计算)
-SRC_BPE_MODEL_PATH = f"{PREPARED_DATA_DIR}/bpe_model.model"  # SentencePiece模型
-TGT_BPE_MODEL_PATH = f"{PREPARED_DATA_DIR}/bpe_model.model"  # 共享词汇表，使用同一个模型
-
-# --- 数据文件路径 ---
-TRAIN_DATA_PATH = f"{PREPARED_DATA_DIR}/train_chunks"
-VALID_DATA_PATH = f"{PREPARED_DATA_DIR}/validation_chunks"
-TEST_DATA_PATH = f"{PREPARED_DATA_DIR}/test_chunks"
-VOCAB_SRC_PATH = f"{PREPARED_DATA_DIR}/vocab_src.pt"
-VOCAB_TGT_PATH = f"{PREPARED_DATA_DIR}/vocab_tgt.pt"
-METADATA_PATH = f"{PREPARED_DATA_DIR}/metadata.json"
+if os.path.exists('/root/autodl-tmp'):  # AutoDL环境检测
+    BEST_MODEL_PATH = f"{CHECKPOINTS_DIR}/{BEST_MODEL_NAME}"
+    LATEST_MODEL_PATH = f"{CHECKPOINTS_DIR}/{LATEST_MODEL_NAME}"
+    BPE_MODEL_PATH = f"{PREPARED_DATA_DIR}/tokenizer.json"  # 使用Hugging Face格式
+    BPE_VOCAB_PATH = f"{PREPARED_DATA_DIR}/vocab.json"
+    
+    # SentencePiece模型路径 (用于BLEU计算)
+    SRC_BPE_MODEL_PATH = f"{PREPARED_DATA_DIR}/bpe_model.model"  # SentencePiece模型
+    TGT_BPE_MODEL_PATH = f"{PREPARED_DATA_DIR}/bpe_model.model"  # 共享词汇表，使用同一个模型
+    
+    # --- 数据文件路径 ---
+    TRAIN_DATA_PATH = f"{PREPARED_DATA_DIR}/train_chunks"
+    VALID_DATA_PATH = f"{PREPARED_DATA_DIR}/validation_chunks"
+    TEST_DATA_PATH = f"{PREPARED_DATA_DIR}/test_chunks"
+    VOCAB_SRC_PATH = f"{PREPARED_DATA_DIR}/vocab_src.pt"
+    VOCAB_TGT_PATH = f"{PREPARED_DATA_DIR}/vocab_tgt.pt"
+    METADATA_PATH = f"{PREPARED_DATA_DIR}/metadata.json"
+else:  # 本地开发环境
+    BEST_MODEL_PATH = f"{CHECKPOINTS_DIR}/{BEST_MODEL_NAME}"
+    LATEST_MODEL_PATH = f"{CHECKPOINTS_DIR}/{LATEST_MODEL_NAME}"
+    BPE_MODEL_PATH = f"{PREPARED_DATA_DIR}/tokenizer.json"  # 使用Hugging Face格式
+    BPE_VOCAB_PATH = f"{PREPARED_DATA_DIR}/vocab.json"
+    
+    # SentencePiece模型路径 (用于BLEU计算)
+    SRC_BPE_MODEL_PATH = f"{PREPARED_DATA_DIR}/bpe_model.model"  # SentencePiece模型
+    TGT_BPE_MODEL_PATH = f"{PREPARED_DATA_DIR}/bpe_model.model"  # 共享词汇表，使用同一个模型
+    
+    # --- 数据文件路径 ---
+    TRAIN_DATA_PATH = f"{PREPARED_DATA_DIR}/train_chunks"
+    VALID_DATA_PATH = f"{PREPARED_DATA_DIR}/validation_chunks"
+    TEST_DATA_PATH = f"{PREPARED_DATA_DIR}/test_chunks"
+    VOCAB_SRC_PATH = f"{PREPARED_DATA_DIR}/vocab_src.pt"
+    VOCAB_TGT_PATH = f"{PREPARED_DATA_DIR}/vocab_tgt.pt"
+    METADATA_PATH = f"{PREPARED_DATA_DIR}/metadata.json"
 
 # =============================================================================
 # 配置验证函数
