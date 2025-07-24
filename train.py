@@ -141,9 +141,40 @@ class EnhancedTrainer:
         
         logger.info("✅ 训练器初始化完成")
     
+    def get_lr(self, logical_step: int) -> float:
+        """
+        新的学习率调度方法 - 支持Cosine调度器
+        
+        Args:
+            logical_step: 当前逻辑步数
+        
+        Returns:
+            学习率
+        """
+        if config.SCHEDULER_TYPE == 'cosine':
+            warmup_steps = config.WARMUP_STEPS
+            total_steps = config.TOTAL_LOGICAL_STEPS
+            max_lr = config.MAX_LEARNING_RATE
+            min_lr = config.MIN_LEARNING_RATE
+            
+            if logical_step < warmup_steps:
+                return max_lr * logical_step / warmup_steps
+            elif logical_step > total_steps:
+                return min_lr
+            else:
+                progress = (logical_step - warmup_steps) / (total_steps - warmup_steps)
+                cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return min_lr + (max_lr - min_lr) * cosine_decay
+        else:  # inverse_sqrt
+            warmup_steps = config.WARMUP_STEPS
+            d_model = config.D_MODEL
+            step = max(1, logical_step)
+            lr = (d_model ** -0.5) * min(step ** -0.5, step * (warmup_steps ** -1.5))
+            return lr * config.LEARNING_RATE_SCALE
+    
     def enhanced_lr_schedule(self, step: int) -> float:
         """
-        增强学习率调度 - 基于"Attention is All You Need"论文
+        增强学习率调度 - 基于"Attention is All You Need"论文 (保留兼容性)
         
         LR = d_model^(-0.5) * min(step^(-0.5), step * warmup_steps^(-1.5)) * scale
         
@@ -231,7 +262,8 @@ class EnhancedTrainer:
                 tgt_mask = tgt_mask[:config.MAX_SEQ_LEN, :config.MAX_SEQ_LEN]
         
         # 学习率调度
-        lr = self.enhanced_lr_schedule(self.global_step)
+        logical_step = self.global_step // config.GRADIENT_ACCUMULATION_STEPS
+        lr = self.get_lr(logical_step)
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
         
@@ -267,10 +299,11 @@ class EnhancedTrainer:
             # scaler.update() 更新缩放因子，为下一次迭代做准备
             scaler.update()
         
-        # 返回损失和梯度范数（如果有梯度更新）
+        # 【关键修改】在函数的最后，明确地只返回Python标量
         if self.global_step % config.GRADIENT_ACCUMULATION_STEPS == 0:
             return loss.item(), grad_norm.item()
         else:
+            # 确保这里也只返回标量
             return loss.item(), None
     
     def train_step(self, batch_data: Dict[str, torch.Tensor]) -> float:
@@ -608,48 +641,25 @@ class EnhancedTrainer:
         
         return avg_loss, bleu_score
     
-    def save_checkpoint(self, bleu_score: float, val_loss: float, is_best: bool = False):
-        """
-        保存检查点
-        """
+    def save_checkpoint(self, is_best: bool = False, current_bleu: Optional[float] = None, current_loss: Optional[float] = None):
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'global_step': self.global_step,
             'best_bleu': self.best_bleu,
-            'bleu_score': bleu_score,
-            'val_loss': val_loss,
-            'config': {
-                'src_vocab_size': self.vocab_size,
-                'tgt_vocab_size': self.vocab_size,
-                'd_model': config.D_MODEL,
-                'nhead': config.NHEAD,
-                'num_encoder_layers': config.NUM_ENCODER_LAYERS,
-                'num_decoder_layers': config.NUM_DECODER_LAYERS,
-                'dim_feedforward': config.DIM_FEEDFORWARD,
-                'dropout': config.DROPOUT
-            }
+            'current_bleu': current_bleu,
+            'current_loss': current_loss,
         }
-        
-        # 保存最新检查点
         latest_path = os.path.join(config.CHECKPOINTS_DIR, 'latest_model.pt')
         torch.save(checkpoint, latest_path)
-        
-        # 保存最佳模型
         if is_best:
-            best_path = os.path.join(config.CHECKPOINTS_DIR, f'best_model_bleu{bleu_score:.1f}.pt')
+            best_path = os.path.join(config.CHECKPOINTS_DIR, f'best_model_bleu{self.best_bleu:.2f}.pt')
             torch.save(checkpoint, best_path)
             logger.info(f"💾 保存最佳模型: {best_path}")
-        
-        # 定期保存（基于逻辑步）
-        logical_step = self.global_step // config.GRADIENT_ACCUMULATION_STEPS
-        if logical_step % config.SAVE_EVERY_LOGICAL_STEPS == 0:
-            step_path = os.path.join(config.CHECKPOINTS_DIR, f'model_logical_step_{logical_step}.pt')
-            torch.save(checkpoint, step_path)
     
     def train(self):
         """
-        主训练循环 - [已集成AMP混合精度训练]
+        主训练循环 - [已修复tqdm与恢复逻辑]
         """
         logger.info("🚀 开始训练 (已启用混合精度AMP)")
         logger.info(f"🎯 目标: BLEU ≥ 25.0")
@@ -662,14 +672,40 @@ class EnhancedTrainer:
         scaler = torch.amp.GradScaler('cuda')
         
         self.model.train()
-        train_iter = itertools.cycle(self.train_loader)
-        logical_step = 0  # 逻辑更新步数
         
-        # 使用tqdm作为主循环的进度条，监控物理步
-        progress_bar = tqdm(range(1, config.TRAIN_STEPS + 1), desc="🚀 训练中", unit="step")
+        # ------------------- 核心修复逻辑 -------------------
+        # 1. 确定起始物理步数。如果是新训练，self.global_step是0。
+        #    如果是恢复训练，它已经是检查点里的值了，比如 96000。
+        start_step = self.global_step + 1
         
-        for self.global_step in progress_bar:
-            batch_data = next(train_iter)
+        # 2. 创建一个正确的、有限的迭代器
+        train_iter = iter(self.train_loader)
+        
+        # 3. 创建 tqdm 进度条
+        #    - total 是总步数
+        #    - initial 是显示的起始步数
+        progress_bar = tqdm(
+            initial=start_step,
+            total=config.TRAIN_STEPS + 1,
+            desc="🚀 训练中",
+            unit="step"
+        )
+        
+        logical_step = self.global_step // config.GRADIENT_ACCUMULATION_STEPS  # 基于恢复的步数计算逻辑步
+        
+        # 4. 主循环：直接控制循环次数，而不是依赖无限迭代器
+        for step in range(start_step, config.TRAIN_STEPS + 1):
+            self.global_step = step  # 手动更新 global_step
+            
+            try:
+                batch_data = next(train_iter)
+            except StopIteration:
+                # 数据加载器的一个epoch结束了，重新创建迭代器
+                logger.info("🔄 数据集 epoch 结束，重新开始...")
+                train_iter = iter(self.train_loader)
+                batch_data = next(train_iter)
+            # ----------------------------------------------------
+             
             train_result = self.train_step_amp(batch_data, scaler)  # 使用AMP版本的训练步骤
             
             # 处理返回值
@@ -678,6 +714,8 @@ class EnhancedTrainer:
             else:
                 loss = train_result
                 grad_norm = None
+            
+            # 内存监控代码已移除 - 诊断完成
             
             # ================= 核心修正：所有逻辑都基于参数更新点 =================
             if self.global_step % config.GRADIENT_ACCUMULATION_STEPS == 0:
@@ -740,7 +778,7 @@ class EnhancedTrainer:
                         
                         if self.best_bleu >= 25.0:
                             logger.info(f"🏆 达成目标! BLEU {self.best_bleu:.3f} ≥ 25.0")
-                            self.save_checkpoint(bleu_score, val_loss, is_best=True)
+                            self.save_checkpoint(is_best=True, current_bleu=bleu_score, current_loss=val_loss)
                             break
                     else:
                         self.no_improvement_steps += config.VALIDATE_EVERY_LOGICAL_STEPS
@@ -750,7 +788,7 @@ class EnhancedTrainer:
                             logger.info(f"📉 无提升: BLEU {bleu_score:.3f} ({improvement:+.3f})")
                     
                     # 保存检查点
-                    self.save_checkpoint(bleu_score, val_loss, is_best=is_best)
+                    self.save_checkpoint(is_best=is_best, current_bleu=bleu_score, current_loss=val_loss)
                     
                     # 早停检查（使用配置的耐心参数，基于逻辑步）
                     patience_logical_steps = config.EARLY_STOPPING_PATIENCE * config.VALIDATE_EVERY_LOGICAL_STEPS
@@ -762,15 +800,20 @@ class EnhancedTrainer:
                 
                 # --- 定期保存检查点 (基于逻辑步) ---
                 if logical_step > 0 and logical_step % config.SAVE_EVERY_LOGICAL_STEPS == 0:
-                    self.save_checkpoint(0.0, 0.0, is_best=False)  # 定期保存
+                    self.save_checkpoint(is_best=False)  # 定期保存
             
-            # 检查是否达到目标
+            # 更新tqdm进度条
+            progress_bar.update(1)
+            
+            # 检查是否达到目标，以防万一
             if self.best_bleu >= 25.0:
                 break
             
             # GPU内存清理
             if self.global_step % 1000 == 0:
                 torch.cuda.empty_cache()
+        
+        progress_bar.close()  # 循环结束后关闭进度条
         
         # 训练完成
         total_time = time.time() - self.start_time

@@ -81,3 +81,17 @@ htmlcov/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Project specific temporary files
+=2.0.0
+train_patch_instructions.txt
+training_diagnosis.json
+
+# Vercel deployment
+.vercel/
+
+# Test files (optional - remove if you want to track them)
+test_*.py
+
+# Shell scripts (optional - remove if you want to track them)
+*.sh

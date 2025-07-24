@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# data_utils.py
+# data_utils.py (最终优化版)
 # 项目宪法：WMT14数据加载器 - 严格遵循"Attention is All You Need"论文
 # 绝对适配现实硬件：分块加载 + 内存高效 + 批处理优化
 
@@ -7,10 +7,11 @@ import os
 import json
 import torch
 import random
+import math
 import numpy as np
 import sentencepiece as spm
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Iterator
+from typing import List, Dict, Tuple, Optional
 from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.nn.utils.rnn import pad_sequence
 import logging
@@ -278,114 +279,67 @@ class WMT14ChunkedDataset(Dataset):
             'tgt_output': torch.tensor(tgt_output, dtype=torch.long)
         }
 
-class DynamicTokenSampler(Sampler):
+class ChunkedDynamicBatchSampler(Sampler):
     """
-    动态批处理采样器 - 按总token数打包批次
-    
-    核心原则：
-    1. 最大化GPU利用率：确保每个批次都让GPU"吃饱"，但又不会"撑着"
-    2. 避免OOM错误：从根本上解决了长句批次导致的显存溢出问题
-    3. 更稳定的训练：确保每次参数更新所依据的token数量大致相等
+    分块动态批处理采样器 - 终极性能优化版
     """
-    
     def __init__(self, dataset: WMT14ChunkedDataset, max_tokens: int, shuffle: bool = True):
-        """
-        初始化动态采样器
-        
-        Args:
-            dataset: WMT14分块数据集
-            max_tokens: 每批次最大token数
-            shuffle: 是否打乱数据
-        """
         self.dataset = dataset
         self.max_tokens = max_tokens
         self.shuffle = shuffle
-        
-        logger.info(f"🔍 [Dynamic Sampler] 正在计算所有句子的长度...")
-        # 注意：这需要一次性遍历数据集来获取长度，可能会稍慢
-        # 但只在初始化时执行一次
-        self.lengths = []
-        
-        # 安全地遍历分块数据集
-        try:
-            for i in tqdm(range(len(dataset)), desc="计算长度"):
-                try:
-                    # 取源语言和目标语言中较长的一个作为长度代表
-                    # 在__getitem__中，tgt_input比tgt_output多一个BOS，所以用它
-                    item = dataset[i]
-                    src_len = len(item['src'])
-                    tgt_len = len(item['tgt_input'])
-                    self.lengths.append(max(src_len, tgt_len))
-                except Exception as e:
-                    logger.warning(f"⚠️ 跳过损坏的样本 {i}: {str(e)}")
-                    # 使用平均长度作为占位符
-                    if self.lengths:
-                        self.lengths.append(int(np.mean(self.lengths)))
-                    else:
-                        self.lengths.append(50)  # 默认长度
-        except Exception as e:
-            logger.error(f"❌ 长度计算失败: {str(e)}")
-            raise RuntimeError(f"动态采样器初始化失败: {str(e)}")
-        
-        self.indices = np.arange(len(self.lengths))
-        
-        logger.info(f"✅ [Dynamic Sampler] 长度计算完成")
-        logger.info(f"📊 平均序列长度: {np.mean(self.lengths):.1f}")
-        logger.info(f"📊 最大序列长度: {np.max(self.lengths)}")
-        logger.info(f"📊 最小序列长度: {np.min(self.lengths)}")
+        logger.info(f"🚀 [ChunkedDynamicBatchSampler] 初始化完成")
+        logger.info(f"📊 目标token数/批: {max_tokens:,}")
 
     def __iter__(self):
+        chunk_indices = list(range(len(self.dataset.chunk_files)))
         if self.shuffle:
-            # 先打乱索引
-            np.random.shuffle(self.indices)
+            random.shuffle(chunk_indices)
         
-        # 按长度排序索引（一种常见的技巧，可以减少padding）
-        # 使用mergesort保证排序的稳定性
-        sorted_indices = self.indices[np.argsort([self.lengths[i] for i in self.indices], kind='mergesort')]
-        
-        batches = []
-        current_batch = []
-        current_batch_tokens = 0
-        
-        for idx in sorted_indices:
-            seq_len = self.lengths[idx]
-            if not current_batch:
-                # 新批次开始
-                current_batch.append(idx)
-                current_batch_tokens = seq_len
-            elif (len(current_batch) + 1) * max(current_batch_tokens, seq_len) > self.max_tokens:
-                # 添加当前句子会导致token数超限，先完成当前批次
-                batches.append(current_batch)
-                # 开始新批次
-                current_batch = [idx]
-                current_batch_tokens = seq_len
-            else:
-                # 添加到当前批次
-                current_batch.append(idx)
-                current_batch_tokens = max(current_batch_tokens, seq_len)
-        
-        # 添加最后一个批次
-        if current_batch:
-            batches.append(current_batch)
+        for chunk_idx in chunk_indices:
+            self.dataset._load_chunk(chunk_idx)
             
-        if self.shuffle:
-            # 再次打乱批次的顺序，以保证训练的随机性
-            random.shuffle(batches)
+            chunk_size = self.dataset.current_chunk_size
+            indices_in_chunk = list(range(chunk_size))
             
-        logger.info(f"📦 [Dynamic Sampler] 生成了 {len(batches)} 个动态批次")
-        if batches:
-            avg_batch_size = np.mean([len(batch) for batch in batches])
-            logger.info(f"📊 平均批次大小: {avg_batch_size:.1f} 句子")
+            lengths_in_chunk = [max(len(src), len(tgt) + 1) for src, tgt in self.dataset.current_chunk_data]
             
-        return iter(batches)
+            sorted_local_indices = sorted(indices_in_chunk, key=lambda i: lengths_in_chunk[i])
+            
+            batch_of_indices = []
+            current_max_len = 0
+            for local_idx in sorted_local_indices:
+                global_idx = self.dataset.cumulative_counts[chunk_idx] + local_idx
+                seq_len = lengths_in_chunk[local_idx]
+                
+                # 更新当前批次的最大长度
+                if not batch_of_indices:
+                    current_max_len = seq_len
+                else:
+                    current_max_len = max(current_max_len, seq_len)
 
+                if (len(batch_of_indices) + 1) * current_max_len > self.max_tokens:
+                    if batch_of_indices:
+                        yield batch_of_indices
+                    batch_of_indices = [global_idx]
+                    current_max_len = seq_len
+                else:
+                    batch_of_indices.append(global_idx)
+            
+            if batch_of_indices:
+                yield batch_of_indices
+    
     def __len__(self):
-        # 这是一个估计值，实际批次数量可能会略有不同
-        if len(self.lengths) == 0:
-            return 0
-        avg_length = np.mean(self.lengths)
-        estimated_batch_size = max(1, self.max_tokens // avg_length)
-        return max(1, len(self.indices) // estimated_batch_size)
+        # 这是一个合理的估计值，用于tqdm等工具
+        # 这个数字不会影响实际的迭代次数
+        if not hasattr(self, '_estimated_len'):
+            try:
+                avg_len = self.dataset.metadata['splits'][self.dataset.split_name]['avg_src_len']
+                num_samples = self.dataset.total_samples
+                sentences_per_batch = self.max_tokens / avg_len
+                self._estimated_len = int(math.ceil(num_samples / sentences_per_batch))
+            except:
+                self._estimated_len = 65000  # 如果元数据有问题，回退到一个默认值
+        return self._estimated_len
 
 def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """
@@ -440,42 +394,15 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         raise RuntimeError(f"批处理整理失败: {str(e)}")
 
 def create_data_loaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """
-    创建数据加载器 - [已集成动态批处理]
-    
-    核心原则：
-    1. 绝对忠于原文精神：正确的批处理大小和采样
-    2. 绝对适配现实硬件：动态批处理最大化GPU利用率
-    3. 绝对信息透明：清晰的配置日志
-    4. 绝对工程专业：错误处理和验证
-    
-    Returns:
-        Tuple[DataLoader, DataLoader, DataLoader]: (train_loader, valid_loader, test_loader)
-    """
-    logger.info("🚀 创建数据加载器 (已启用动态批处理)...")
-    
+    logger.info("🚀 创建数据加载器 (已启用分块动态批处理)...")
     try:
-        # 创建数据集
         train_dataset = WMT14ChunkedDataset('train', shuffle_chunks=True)
         valid_dataset = WMT14ChunkedDataset('validation', shuffle_chunks=False)
-        # 测试集通常不需要动态批处理，可以使用固定批次大小
         test_dataset = WMT14ChunkedDataset('test', shuffle_chunks=False)
         
-        # 创建动态采样器
-        # BATCH_SIZE_TOKENS 在 config.py 中定义，例如 4096
-        train_sampler = DynamicTokenSampler(train_dataset, config.BATCH_SIZE_TOKENS, shuffle=True)
-        valid_sampler = DynamicTokenSampler(valid_dataset, config.BATCH_SIZE_TOKENS, shuffle=False)
+        # 使用标准 DataLoader 配合自定义 batch_sampler
+        train_sampler = ChunkedDynamicBatchSampler(train_dataset, config.BATCH_SIZE_TOKENS, shuffle=True)
         
-        logger.info(f"📊 数据集统计:")
-        logger.info(f"  训练集: {len(train_dataset):,} 样本")
-        logger.info(f"  验证集: {len(valid_dataset):,} 样本")
-        logger.info(f"  测试集: {len(test_dataset):,} 样本")
-        logger.info(f"📦 动态批处理配置:")
-        logger.info(f"  目标token数/批: {config.BATCH_SIZE_TOKENS:,}")
-        logger.info(f"  最大序列长度: {config.MAX_SEQ_LEN}")
-        
-        # 创建数据加载器
-        # 注意：使用自定义sampler时，batch_size必须为1，且不能设置shuffle和drop_last
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=train_sampler,
@@ -484,18 +411,19 @@ def create_data_loaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
             pin_memory=config.PIN_MEMORY
         )
         
+        # 验证和测试集很小，用固定批次大小
         valid_loader = DataLoader(
             valid_dataset,
-            batch_sampler=valid_sampler,
+            batch_size=config.MAX_BATCH_SIZE,
+            shuffle=False,
             collate_fn=collate_fn,
             num_workers=config.NUM_WORKERS,
             pin_memory=config.PIN_MEMORY
         )
         
-        # 测试加载器仍然使用固定批次大小，更简单可控
         test_loader = DataLoader(
             test_dataset,
-            batch_size=config.MAX_BATCH_SIZE,  # 使用一个固定的较小批次大小
+            batch_size=config.MAX_BATCH_SIZE,
             shuffle=False,
             collate_fn=collate_fn,
             num_workers=config.NUM_WORKERS,
@@ -503,13 +431,15 @@ def create_data_loaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
         )
         
         logger.info(f"✅ 数据加载器创建成功")
-        logger.info(f"📊 批次统计:")
-        logger.info(f"  训练批次: {len(train_loader):,} (动态)")
-        logger.info(f"  验证批次: {len(valid_loader):,}")
-        logger.info(f"  测试批次: {len(test_loader):,}")
+        logger.info(f"📊 数据集统计:")
+        logger.info(f"  训练集: {len(train_dataset):,} 样本")
+        logger.info(f"  验证集: {len(valid_dataset):,} 样本")
+        logger.info(f"  测试集: {len(test_dataset):,} 样本")
+        logger.info(f"📦 分块动态批处理配置:")
+        logger.info(f"  目标token数/批: {config.BATCH_SIZE_TOKENS:,}")
+        logger.info(f"  最大序列长度: {config.MAX_SEQ_LEN}")
         
         return train_loader, valid_loader, test_loader
-        
     except Exception as e:
         logger.error(f"❌ 数据加载器创建失败: {str(e)}")
         logger.error("💡 建议检查:")

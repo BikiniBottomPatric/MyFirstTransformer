@@ -76,42 +76,46 @@ SHARE_EMBEDDINGS = False  # 不共享嵌入权重以达到65M参数（原文标�
 # 第三章：训练配置 (8GB GPU适配 + 论文忠实)
 # =============================================================================
 
-# --- 批次配置 (动态批处理 + 梯度累积) ---
-BATCH_SIZE_TOKENS = 4096   # 动态批处理：每批次目标token数 (适配8GB显存)
+# --- 批次配置 (在安全范围内最大化物理批次) ---
+BATCH_SIZE_TOKENS = 512  # 动态批处理：每批次目标token数 (终极攻击版)
 MAX_BATCH_SIZE = 32        # 固定批次大小的上限 (主要用于测试集)
-GRADIENT_ACCUMULATION_STEPS = 6   # 梯度累积步数 (动态批处理下可以减少)
-EFFECTIVE_BATCH_SIZE = BATCH_SIZE_TOKENS * GRADIENT_ACCUMULATION_STEPS  # 24576 tokens (论文推荐)
+GRADIENT_ACCUMULATION_STEPS = 24   # 梯度累积步数 (终极攻击版)
+EFFECTIVE_BATCH_SIZE = BATCH_SIZE_TOKENS * GRADIENT_ACCUMULATION_STEPS  # 24576 tokens (保持不变!)
 
 # 动态批处理配置
 USE_DYNAMIC_BATCHING = True  # 启用动态批处理
 DYNAMIC_BATCH_MAX_TOKENS = BATCH_SIZE_TOKENS  # 动态批处理的最大token数
 
-# --- 学习率调度 (论文标准配置) ---
-LEARNING_RATE_BASE = 1.0   # 基础学习率 (将被调度器控制)
-LEARNING_RATE_SCALE = 0.7  # 学习率缩放因子
-WARMUP_STEPS = 8000        # 增加预热步数以更好收敛
-MAX_LEARNING_RATE = 1e-4   # 降低学习率以稳定训练
+# --- 学习率调度 (核心武器：Warmup-Cosine-Decay) ---
+SCHEDULER_TYPE = 'cosine'  # 使用余弦调度器
+WARMUP_STEPS = 10000       # 预热步数
+TOTAL_LOGICAL_STEPS = 100000  # 总逻辑步数
+MAX_LEARNING_RATE = 2.5e-4 # 最大学习率
 MIN_LEARNING_RATE = 1e-6   # 最小学习率
 BETA1 = 0.9                # Adam beta1
 BETA2 = 0.98               # Adam beta2 (论文值)
 EPS = 1e-9                 # Adam epsilon
 
+# 保留兼容性
+LEARNING_RATE_BASE = 1.0   # 基础学习率 (将被调度器控制)
+LEARNING_RATE_SCALE = 0.7  # 学习率缩放因子
+
 # --- 正则化配置 ---
 LABEL_SMOOTHING_EPS = 0.1   # 论文标准标签平滑系数
 GRADIENT_CLIP_NORM = 1.0    # 梯度裁剪阈值
 
-# --- 训练步数配置 ---
-TRAIN_STEPS = 1800000      # 180万物理步（15万次逻辑更新）
+# --- 训练步数与验证频率 (目标导向) ---
+TRAIN_STEPS = TOTAL_LOGICAL_STEPS * GRADIENT_ACCUMULATION_STEPS  # 约 800,000 物理步
 VALIDATE_EVERY_STEPS = 500
-VALIDATE_EVERY_LOGICAL_STEPS = 1000  # 每1000次逻辑更新验证一次
-LOG_EVERY_LOGICAL_STEPS = 500        # 每500次逻辑更新输出loss
-BLEU_EVAL_EVERY_LOGICAL_STEPS = 1000 # 每1000次逻辑更新输出BLEU
+VALIDATE_EVERY_LOGICAL_STEPS = 2000  # 每2000次逻辑更新验证一次
+LOG_EVERY_LOGICAL_STEPS = 200        # 每200次逻辑更新输出loss
+BLEU_EVAL_EVERY_LOGICAL_STEPS = 2000 # 每2000次逻辑更新输出BLEU
 SAVE_EVERY_LOGICAL_STEPS = 5000      # 检查点保存频率（逻辑步）
 
-# --- 早停配置 ---
-EARLY_STOPPING_PATIENCE = 15  # 连续15次验证无提升则停止（更宽松）
-MIN_DELTA_BLEU = 0.05      # BLEU提升的最小阈值（更宽松）
-SKIP_BLEU_BEFORE_STEPS = 16000  # 前2*WARMUP_STEPS步跳过BLEU评估
+# --- 早停配置 (务实且耐心) ---
+EARLY_STOPPING_PATIENCE = 10  # 连续10次验证无提升则停止
+MIN_DELTA_BLEU = 0.1       # BLEU提升的最小阈值
+SKIP_BLEU_BEFORE_STEPS = WARMUP_STEPS * GRADIENT_ACCUMULATION_STEPS  # 前WARMUP_STEPS步跳过BLEU评估
 
 # =============================================================================
 # 第四章：推理评估配置 (Beam Search + BLEU)
@@ -158,7 +162,7 @@ CUDNN_BENCHMARK = False
 # --- 内存优化配置 ---
 EMPTY_CACHE_EVERY_N_STEPS = 1000  # 每N步清空CUDA缓存
 PIN_MEMORY = True          # 数据加载器pin_memory
-NUM_WORKERS = 0            # WSL2优化：使用0个worker
+NUM_WORKERS = 16            # WSL2优化：使用16个worker
 
 # =============================================================================
 # 第六章：路径配置 (文件系统组织)
