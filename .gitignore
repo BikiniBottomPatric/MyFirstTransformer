@@ -7,16 +7,77 @@ __pycache__/
 env/
 venv/
 .venv/
+*.egg-info/
+dist/
+build/
 
 # PyTorch
 .ipynb_checkpoints/
+*.pt
+*.pth
+*.ckpt
 
-# Data
+# Data (large files)
 data/
 multi30k/
+data_bpe_original/
+processed_data/
+dataset/data/
+*.tar.gz
+*.zip
+*.bz2
 
-# Logs
+# Model checkpoints (large files)
+checkpoints/*.pt
+checkpoints/*.pth
+!checkpoints/.gitkeep
+
+# Logs and monitoring
 runs/
+logs/
+*.log
+tensorboard/
 
-# IDE
-.vscode/ 
+# Backup directories
+backup_*/
+
+# Environment files
+*.env
+.env.*
+final_env.txt
+my_successful_env_spec.txt
+*_env_*.txt
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json

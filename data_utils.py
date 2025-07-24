@@ -1,133 +1,657 @@
+#!/usr/bin/env python3
 # data_utils.py
-import torch
-from torch.utils.data import DataLoader, Dataset
-from torch.nn.utils.rnn import pad_sequence
-import config
+# 项目宪法：WMT14数据加载器 - 严格遵循"Attention is All You Need"论文
+# 绝对适配现实硬件：分块加载 + 内存高效 + 批处理优化
+
 import os
-import glob
 import json
+import torch
+import random
+import numpy as np
+import sentencepiece as spm
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional, Iterator
+from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.nn.utils.rnn import pad_sequence
+import logging
+from tqdm import tqdm
 
-# --- 全局变量用于缓存加载的词汇表 ---
-_vocab_transform = {}
+# 导入配置
+import config
 
-class PreprocessedDataset(Dataset):
+# 设置日志
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL),
+    format=config.LOG_FORMAT
+)
+logger = logging.getLogger(__name__)
+
+class WMT14ChunkedDataset(Dataset):
     """
-    一个更智能的Dataset类，用于处理分块存储的预处理数据。
-    它会按需加载数据块，以节省内存。
+    WMT14分块数据集 - 项目宪法实现
+    
+    核心原则：
+    1. 绝对忠于原文精神：BOS/EOS处理 + 正确的序列格式
+    2. 绝对适配现实硬件：分块加载，避免内存爆炸
+    3. 绝对信息透明：加载进度 + 清晰错误信息
+    4. 绝对工程专业：缓存机制 + 错误处理
     """
-    def __init__(self, split):
-        self.split = split
-        # 查找所有属于该split的块文件
-        self.chunk_files = sorted(glob.glob(f'data/{self.split}_chunk_*.pt'))
+    
+    def __init__(self, split_name: str, shuffle_chunks: bool = True):
+        """
+        初始化分块数据集
         
-        # 从元数据文件加载长度信息，而不是手动计算
-        metadata_path = 'data/metadata.json'
-        if not os.path.exists(metadata_path):
-            raise FileNotFoundError(f"未找到元数据文件 '{metadata_path}'。请先运行 'preprocess.py'。")
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
+        Args:
+            split_name: 数据分割名称 ('train', 'validation', 'test')
+            shuffle_chunks: 是否打乱分块顺序
+        """
+        self.split_name = split_name
+        self.shuffle_chunks = shuffle_chunks
+        self.prepared_data_dir = Path(config.PREPARED_DATA_DIR)
         
-        if self.split not in metadata:
-            raise ValueError(f"在元数据中未找到 '{self.split}' 的信息。请重新运行 'preprocess.py'。")
+        # 加载元数据
+        self._load_metadata()
+        
+        # 加载BPE模型
+        self._load_bpe_model()
+        
+        # 发现分块文件
+        self._discover_chunks()
+        
+        # 当前加载的分块
+        self.current_chunk_idx = -1
+        self.current_chunk_data = []
+        self.current_chunk_size = 0
+        
+        # 全局样本索引映射
+        self._build_sample_index()
+        
+        logger.info(f"🚀 初始化{split_name}数据集")
+        logger.info(f"📦 分块数量: {len(self.chunk_files)}")
+        logger.info(f"📊 总样本数: {self.total_samples:,}")
+        logger.info(f"🔤 词汇表大小: {self.vocab_size:,}")
+    
+    def _load_metadata(self):
+        """加载预处理元数据"""
+        metadata_file = self.prepared_data_dir / "metadata.json"
+        
+        if not metadata_file.exists():
+            raise FileNotFoundError(
+                f"❌ 元数据文件不存在: {metadata_file}\n"
+                f"💡 请先运行 'python preprocess.py' 进行数据预处理"
+            )
+        
+        try:
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                self.metadata = json.load(f)
             
-        self.chunk_lengths = metadata[self.split]['chunk_lengths']
-        self.total_length = metadata[self.split]['total_length']
+            self.vocab_size = self.metadata['vocab_size']
+            self.bpe_model_path = self.metadata['bpe_model_path']
+            self.special_tokens = self.metadata['special_tokens']
+            self.max_seq_len = self.metadata['max_seq_len']
+            
+            logger.info(f"✅ 元数据加载成功: {metadata_file}")
+            
+        except Exception as e:
+            raise RuntimeError(f"❌ 元数据加载失败: {str(e)}")
+    
+    def _load_bpe_model(self):
+        """加载BPE模型"""
+        if not os.path.exists(self.bpe_model_path):
+            raise FileNotFoundError(
+                f"❌ BPE模型文件不存在: {self.bpe_model_path}\n"
+                f"💡 请先运行 'python preprocess.py' 进行数据预处理"
+            )
         
-        if len(self.chunk_files) != len(self.chunk_lengths):
-            raise RuntimeError("数据块文件数量与元数据记录不匹配。请删除 'data' 目录并重新运行 'preprocess.py'。")
+        try:
+            # 检查是否为Hugging Face tokenizer格式
+            if self.bpe_model_path.endswith('.json'):
+                from transformers import AutoTokenizer
+                tokenizer_dir = os.path.dirname(self.bpe_model_path)
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+                
+                # 验证特殊token（处理token名称映射）
+                vocab = self.tokenizer.get_vocab()
+                token_mapping = {
+                    '<s>': '<bos>',  # 映射<s>到<bos>
+                    '</s>': '<eos>'  # 映射</s>到<eos>
+                }
+                
+                for token, expected_id in self.special_tokens.items():
+                    # 尝试原始token名称
+                    actual_id = vocab.get(token, -1)
+                    # 如果找不到，尝试映射的token名称
+                    if actual_id == -1 and token in token_mapping:
+                        actual_id = vocab.get(token_mapping[token], -1)
+                    
+                    if actual_id != expected_id:
+                        logger.warning(f"⚠️ 特殊token不匹配: {token} 期望={expected_id}, 实际={actual_id}")
+                    else:
+                        logger.info(f"✅ 特殊token映射正确: {token} -> {actual_id}")
+                
+                logger.info(f"✅ Hugging Face tokenizer加载成功: {self.bpe_model_path}")
+            else:
+                # SentencePiece格式
+                import sentencepiece as spm
+                self.sp = spm.SentencePieceProcessor(model_file=self.bpe_model_path)
+                
+                # 验证特殊token
+                for token, expected_id in self.special_tokens.items():
+                    actual_id = self.sp.piece_to_id(token)
+                    if actual_id != expected_id:
+                        logger.warning(f"⚠️ 特殊token不匹配: {token} 期望={expected_id}, 实际={actual_id}")
+                
+                logger.info(f"✅ SentencePiece模型加载成功: {self.bpe_model_path}")
+            
+        except Exception as e:
+            raise RuntimeError(f"❌ BPE模型加载失败: {str(e)}")
+    
+    def _discover_chunks(self):
+        """发现分块文件"""
+        chunk_dir = self.prepared_data_dir / f"{self.split_name}_chunks"
+        
+        if not chunk_dir.exists():
+            raise FileNotFoundError(
+                f"❌ 分块目录不存在: {chunk_dir}\n"
+                f"💡 请先运行 'python preprocess.py' 进行数据预处理"
+            )
+        
+        # 发现所有分块文件
+        self.chunk_files = sorted(list(chunk_dir.glob("chunk_*.pt")))
+        
+        if not self.chunk_files:
+            raise FileNotFoundError(
+                f"❌ 未找到分块文件: {chunk_dir}\n"
+                f"💡 请先运行 'python preprocess.py' 进行数据预处理"
+            )
+        
+        # 打乱分块顺序（仅训练时）
+        if self.shuffle_chunks and self.split_name == 'train':
+            random.shuffle(self.chunk_files)
+        
+        logger.info(f"📦 发现{len(self.chunk_files)}个分块文件")
+    
+    def _build_sample_index(self):
+        """构建样本索引映射 - 优化版本"""
+        logger.info("🔍 构建样本索引...")
+        
+        # 优化：使用元数据中的信息，避免加载所有分块文件
+        if self.split_name in self.metadata.get('splits', {}):
+            split_info = self.metadata['splits'][self.split_name]
+            self.total_samples = split_info['total_samples']
+            chunks_created = split_info['chunks_created']
+            
+            # 估算每个分块的样本数量（除了最后一个可能不满）
+            avg_chunk_size = self.total_samples // chunks_created
+            remainder = self.total_samples % chunks_created
+            
+            self.chunk_sample_counts = [avg_chunk_size] * chunks_created
+            if remainder > 0:
+                self.chunk_sample_counts[-1] += remainder
+            
+            logger.info(f"✅ 快速索引构建完成: {self.total_samples:,} 样本 (基于元数据)")
+        else:
+            # 回退到原始方法（仅在元数据不可用时）
+            logger.warning("⚠️ 元数据不完整，使用慢速索引构建...")
+            self.chunk_sample_counts = []
+            self.total_samples = 0
+            
+            # 快速扫描每个分块的样本数量
+            for chunk_file in tqdm(self.chunk_files, desc="📊 扫描分块"):
+                try:
+                    chunk_data = torch.load(chunk_file, map_location='cpu')
+                    sample_count = len(chunk_data['src_data'])
+                    self.chunk_sample_counts.append(sample_count)
+                    self.total_samples += sample_count
+                    
+                except Exception as e:
+                    logger.error(f"❌ 分块文件损坏: {chunk_file} - {str(e)}")
+                    self.chunk_sample_counts.append(0)
+            
+            logger.info(f"✅ 索引构建完成: {self.total_samples:,} 样本")
+        
+        # 构建累积索引
+        self.cumulative_counts = [0]
+        for count in self.chunk_sample_counts:
+            self.cumulative_counts.append(self.cumulative_counts[-1] + count)
+    
+    def _load_chunk(self, chunk_idx: int):
+        """加载指定分块到内存"""
+        if chunk_idx == self.current_chunk_idx:
+            return  # 已经加载
+        
+        try:
+            chunk_file = self.chunk_files[chunk_idx]
+            chunk_data = torch.load(chunk_file, map_location='cpu')
+            
+            self.current_chunk_data = list(zip(
+                chunk_data['src_data'], 
+                chunk_data['tgt_data']
+            ))
+            self.current_chunk_size = len(self.current_chunk_data)
+            self.current_chunk_idx = chunk_idx
+            
+            # 打乱当前分块内的样本（仅训练时）
+            if self.shuffle_chunks and self.split_name == 'train':
+                random.shuffle(self.current_chunk_data)
+            
+        except Exception as e:
+            logger.error(f"❌ 分块加载失败: {chunk_file} - {str(e)}")
+            raise RuntimeError(f"分块加载失败: {str(e)}")
+    
+    def _find_chunk_and_local_idx(self, global_idx: int) -> Tuple[int, int]:
+        """根据全局索引找到对应的分块和局部索引"""
+        for chunk_idx in range(len(self.cumulative_counts) - 1):
+            if self.cumulative_counts[chunk_idx] <= global_idx < self.cumulative_counts[chunk_idx + 1]:
+                local_idx = global_idx - self.cumulative_counts[chunk_idx]
+                return chunk_idx, local_idx
+        
+        raise IndexError(f"全局索引超出范围: {global_idx} >= {self.total_samples}")
+    
+    def __len__(self) -> int:
+        """返回数据集大小"""
+        return self.total_samples
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """获取单个样本"""
+        if idx >= self.total_samples:
+            raise IndexError(f"索引超出范围: {idx} >= {self.total_samples}")
+        
+        # 找到对应的分块和局部索引
+        chunk_idx, local_idx = self._find_chunk_and_local_idx(idx)
+        
+        # 加载分块（如果需要）
+        self._load_chunk(chunk_idx)
+        
+        # 获取样本
+        src_tokens, tgt_tokens = self.current_chunk_data[local_idx]
+        
+        # 添加BOS/EOS token（遵循论文标准）
+        # 源序列：不添加BOS/EOS（在Encoder中处理）
+        # 目标序列：添加BOS作为输入，EOS作为标签
+        tgt_input = [config.BOS_IDX] + tgt_tokens  # Decoder输入
+        tgt_output = tgt_tokens + [config.EOS_IDX]  # Decoder标签
+        
+        return {
+            'src': torch.tensor(src_tokens, dtype=torch.long),
+            'tgt_input': torch.tensor(tgt_input, dtype=torch.long),
+            'tgt_output': torch.tensor(tgt_output, dtype=torch.long)
+        }
 
-        self.cumulative_lengths = [sum(self.chunk_lengths[:i+1]) for i in range(len(self.chunk_lengths))]
+class DynamicTokenSampler(Sampler):
+    """
+    动态批处理采样器 - 按总token数打包批次
+    
+    核心原则：
+    1. 最大化GPU利用率：确保每个批次都让GPU"吃饱"，但又不会"撑着"
+    2. 避免OOM错误：从根本上解决了长句批次导致的显存溢出问题
+    3. 更稳定的训练：确保每次参数更新所依据的token数量大致相等
+    """
+    
+    def __init__(self, dataset: WMT14ChunkedDataset, max_tokens: int, shuffle: bool = True):
+        """
+        初始化动态采样器
         
-        # 用于缓存最近加载的块，避免频繁IO
-        self._cache = {}
+        Args:
+            dataset: WMT14分块数据集
+            max_tokens: 每批次最大token数
+            shuffle: 是否打乱数据
+        """
+        self.dataset = dataset
+        self.max_tokens = max_tokens
+        self.shuffle = shuffle
+        
+        logger.info(f"🔍 [Dynamic Sampler] 正在计算所有句子的长度...")
+        # 注意：这需要一次性遍历数据集来获取长度，可能会稍慢
+        # 但只在初始化时执行一次
+        self.lengths = []
+        
+        # 安全地遍历分块数据集
+        try:
+            for i in tqdm(range(len(dataset)), desc="计算长度"):
+                try:
+                    # 取源语言和目标语言中较长的一个作为长度代表
+                    # 在__getitem__中，tgt_input比tgt_output多一个BOS，所以用它
+                    item = dataset[i]
+                    src_len = len(item['src'])
+                    tgt_len = len(item['tgt_input'])
+                    self.lengths.append(max(src_len, tgt_len))
+                except Exception as e:
+                    logger.warning(f"⚠️ 跳过损坏的样本 {i}: {str(e)}")
+                    # 使用平均长度作为占位符
+                    if self.lengths:
+                        self.lengths.append(int(np.mean(self.lengths)))
+                    else:
+                        self.lengths.append(50)  # 默认长度
+        except Exception as e:
+            logger.error(f"❌ 长度计算失败: {str(e)}")
+            raise RuntimeError(f"动态采样器初始化失败: {str(e)}")
+        
+        self.indices = np.arange(len(self.lengths))
+        
+        logger.info(f"✅ [Dynamic Sampler] 长度计算完成")
+        logger.info(f"📊 平均序列长度: {np.mean(self.lengths):.1f}")
+        logger.info(f"📊 最大序列长度: {np.max(self.lengths)}")
+        logger.info(f"📊 最小序列长度: {np.min(self.lengths)}")
+
+    def __iter__(self):
+        if self.shuffle:
+            # 先打乱索引
+            np.random.shuffle(self.indices)
+        
+        # 按长度排序索引（一种常见的技巧，可以减少padding）
+        # 使用mergesort保证排序的稳定性
+        sorted_indices = self.indices[np.argsort([self.lengths[i] for i in self.indices], kind='mergesort')]
+        
+        batches = []
+        current_batch = []
+        current_batch_tokens = 0
+        
+        for idx in sorted_indices:
+            seq_len = self.lengths[idx]
+            if not current_batch:
+                # 新批次开始
+                current_batch.append(idx)
+                current_batch_tokens = seq_len
+            elif (len(current_batch) + 1) * max(current_batch_tokens, seq_len) > self.max_tokens:
+                # 添加当前句子会导致token数超限，先完成当前批次
+                batches.append(current_batch)
+                # 开始新批次
+                current_batch = [idx]
+                current_batch_tokens = seq_len
+            else:
+                # 添加到当前批次
+                current_batch.append(idx)
+                current_batch_tokens = max(current_batch_tokens, seq_len)
+        
+        # 添加最后一个批次
+        if current_batch:
+            batches.append(current_batch)
+            
+        if self.shuffle:
+            # 再次打乱批次的顺序，以保证训练的随机性
+            random.shuffle(batches)
+            
+        logger.info(f"📦 [Dynamic Sampler] 生成了 {len(batches)} 个动态批次")
+        if batches:
+            avg_batch_size = np.mean([len(batch) for batch in batches])
+            logger.info(f"📊 平均批次大小: {avg_batch_size:.1f} 句子")
+            
+        return iter(batches)
 
     def __len__(self):
-        return self.total_length
+        # 这是一个估计值，实际批次数量可能会略有不同
+        if len(self.lengths) == 0:
+            return 0
+        avg_length = np.mean(self.lengths)
+        estimated_batch_size = max(1, self.max_tokens // avg_length)
+        return max(1, len(self.indices) // estimated_batch_size)
 
-    def __getitem__(self, idx):
-        # 确定索引idx属于哪个块
-        chunk_index = 0
-        while idx >= self.cumulative_lengths[chunk_index]:
-            chunk_index += 1
+def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """
+    批处理整理函数 - 项目宪法实现
+    
+    核心原则：
+    1. 绝对忠于原文精神：正确的填充和掩码
+    2. 绝对适配现实硬件：高效的张量操作
+    3. 绝对信息透明：清晰的张量维度
+    4. 绝对工程专业：错误处理
+    
+    Args:
+        batch: 批次样本列表
         
-        # 计算在块内的局部索引
-        if chunk_index == 0:
-            local_idx = idx
-        else:
-            local_idx = idx - self.cumulative_lengths[chunk_index - 1]
-            
-        # 检查缓存，如果块不在缓存中，则加载它
-        if chunk_index not in self._cache:
-            # 为了节省内存，只缓存最新的块
-            self._cache.clear()
-            self._cache[chunk_index] = torch.load(self.chunk_files[chunk_index])
-            
-        return self._cache[chunk_index][local_idx]
+    Returns:
+        Dict: 批处理后的张量字典
+    """
+    try:
+        # 提取各个序列
+        src_seqs = [item['src'] for item in batch]
+        tgt_input_seqs = [item['tgt_input'] for item in batch]
+        tgt_output_seqs = [item['tgt_output'] for item in batch]
+        
+        # 填充序列（使用PAD_IDX）
+        src_padded = pad_sequence(src_seqs, batch_first=True, padding_value=config.PAD_IDX)
+        tgt_input_padded = pad_sequence(tgt_input_seqs, batch_first=True, padding_value=config.PAD_IDX)
+        tgt_output_padded = pad_sequence(tgt_output_seqs, batch_first=True, padding_value=config.PAD_IDX)
+        
+        # 创建注意力掩码
+        # 源序列掩码：1表示有效token，0表示PAD
+        src_mask = (src_padded != config.PAD_IDX)
+        
+        # 目标序列掩码：1表示有效token，0表示PAD
+        tgt_mask = (tgt_input_padded != config.PAD_IDX)
+        
+        # 创建因果掩码（下三角矩阵）
+        tgt_seq_len = tgt_input_padded.size(1)
+        causal_mask = torch.tril(torch.ones(tgt_seq_len, tgt_seq_len, dtype=torch.bool))
+        
+        return {
+            'src': src_padded,                    # [batch_size, src_seq_len]
+            'tgt_input': tgt_input_padded,        # [batch_size, tgt_seq_len]
+            'tgt_output': tgt_output_padded,      # [batch_size, tgt_seq_len]
+            'src_mask': src_mask,                 # [batch_size, src_seq_len]
+            'tgt_mask': tgt_mask,                 # [batch_size, tgt_seq_len]
+            'causal_mask': causal_mask,           # [tgt_seq_len, tgt_seq_len]
+            'batch_size': len(batch)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 批处理整理失败: {str(e)}")
+        raise RuntimeError(f"批处理整理失败: {str(e)}")
 
-def build_vocab():
-    """从磁盘加载预先构建好的词汇表对象。"""
-    global _vocab_transform
-    if _vocab_transform:
-        return _vocab_transform
+def create_data_loaders() -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """
+    创建数据加载器 - [已集成动态批处理]
+    
+    核心原则：
+    1. 绝对忠于原文精神：正确的批处理大小和采样
+    2. 绝对适配现实硬件：动态批处理最大化GPU利用率
+    3. 绝对信息透明：清晰的配置日志
+    4. 绝对工程专业：错误处理和验证
+    
+    Returns:
+        Tuple[DataLoader, DataLoader, DataLoader]: (train_loader, valid_loader, test_loader)
+    """
+    logger.info("🚀 创建数据加载器 (已启用动态批处理)...")
     
     try:
-        vocab_src = torch.load('data/vocab_src.pt')
-        vocab_tgt = torch.load('data/vocab_tgt.pt')
-    except FileNotFoundError:
-        print("错误：找不到词汇表文件 'data/vocab_src.pt' 或 'data/vocab_tgt.pt'。")
-        print("请先运行 'python preprocess.py' 来生成预处理文件。")
-        exit()
+        # 创建数据集
+        train_dataset = WMT14ChunkedDataset('train', shuffle_chunks=True)
+        valid_dataset = WMT14ChunkedDataset('validation', shuffle_chunks=False)
+        # 测试集通常不需要动态批处理，可以使用固定批次大小
+        test_dataset = WMT14ChunkedDataset('test', shuffle_chunks=False)
         
-    _vocab_transform[config.SRC_LANGUAGE] = vocab_src
-    _vocab_transform[config.TGT_LANGUAGE] = vocab_tgt
-    print("从磁盘加载词汇表成功。")
-    return _vocab_transform
-
-def collate_fn(batch):
-    """
-    为DataLoader整理数据。
-    batch是字典的列表, e.g., [{'src': tensor, 'tgt': tensor}, ...]
-    """
-    src_batch, tgt_batch = [], []
-    for item in batch:
-        src_batch.append(item['src'])
-        tgt_batch.append(item['tgt'])
-    
-    # 将tensor列表填充为统一长度的batch
-    # batch_first=False 使输出形状为 [seq_len, batch_size]
-    src_batch = pad_sequence(src_batch, padding_value=config.PAD_IDX, batch_first=False)
-    tgt_batch = pad_sequence(tgt_batch, padding_value=config.PAD_IDX, batch_first=False)
-    return src_batch, tgt_batch
-
-def get_dataloaders():
-    """
-    为训练、验证和测试集创建并返回最终的DataLoaders。
-    此函数现在只从磁盘加载预处理好的数据。
-    """
-    # 确保词汇表已经加载，虽然在这里不直接使用，但在训练脚本中需要
-    build_vocab() 
-    
-    dataloaders = {}
-    for split in ['train', 'validation', 'test']:
-        # PreprocessedDataset会自己检查文件是否存在，我们在这里不需要重复检查
-        try:
-            dataset = PreprocessedDataset(split)
-        except FileNotFoundError as e:
-            print(e)
-            exit()
+        # 创建动态采样器
+        # BATCH_SIZE_TOKENS 在 config.py 中定义，例如 4096
+        train_sampler = DynamicTokenSampler(train_dataset, config.BATCH_SIZE_TOKENS, shuffle=True)
+        valid_sampler = DynamicTokenSampler(valid_dataset, config.BATCH_SIZE_TOKENS, shuffle=False)
         
-        # 为训练集启用shuffle
-        shuffle = True if split == 'train' else False
+        logger.info(f"📊 数据集统计:")
+        logger.info(f"  训练集: {len(train_dataset):,} 样本")
+        logger.info(f"  验证集: {len(valid_dataset):,} 样本")
+        logger.info(f"  测试集: {len(test_dataset):,} 样本")
+        logger.info(f"📦 动态批处理配置:")
+        logger.info(f"  目标token数/批: {config.BATCH_SIZE_TOKENS:,}")
+        logger.info(f"  最大序列长度: {config.MAX_SEQ_LEN}")
         
-        # 创建DataLoader
-        dataloaders[split] = DataLoader(
-            dataset, 
-            batch_size=config.BATCH_SIZE, 
-            collate_fn=collate_fn, 
-            shuffle=shuffle, 
-            num_workers=config.NUM_WORKERS
+        # 创建数据加载器
+        # 注意：使用自定义sampler时，batch_size必须为1，且不能设置shuffle和drop_last
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_sampler,
+            collate_fn=collate_fn,
+            num_workers=config.NUM_WORKERS,
+            pin_memory=config.PIN_MEMORY
         )
+        
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_sampler=valid_sampler,
+            collate_fn=collate_fn,
+            num_workers=config.NUM_WORKERS,
+            pin_memory=config.PIN_MEMORY
+        )
+        
+        # 测试加载器仍然使用固定批次大小，更简单可控
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=config.MAX_BATCH_SIZE,  # 使用一个固定的较小批次大小
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=config.NUM_WORKERS,
+            pin_memory=config.PIN_MEMORY
+        )
+        
+        logger.info(f"✅ 数据加载器创建成功")
+        logger.info(f"📊 批次统计:")
+        logger.info(f"  训练批次: {len(train_loader):,} (动态)")
+        logger.info(f"  验证批次: {len(valid_loader):,}")
+        logger.info(f"  测试批次: {len(test_loader):,}")
+        
+        return train_loader, valid_loader, test_loader
+        
+    except Exception as e:
+        logger.error(f"❌ 数据加载器创建失败: {str(e)}")
+        logger.error("💡 建议检查:")
+        logger.error("  1. 是否已运行 'python preprocess.py'")
+        logger.error("  2. 预处理数据是否完整")
+        logger.error("  3. 配置参数是否正确")
+        raise RuntimeError(f"数据加载器创建失败: {str(e)}")
+
+def get_vocab_info() -> Dict[str, any]:
+    """
+    获取词汇表信息
     
-    print("从预处理文件创建DataLoaders成功。")
-    # 我们需要返回3个dataloader，而不是一个字典
-    return dataloaders['train'], dataloaders['validation'], dataloaders['test']
+    Returns:
+        Dict: 词汇表信息字典
+    """
+    try:
+        metadata_file = Path(config.PREPARED_DATA_DIR) / "metadata.json"
+        
+        if not metadata_file.exists():
+            raise FileNotFoundError(
+                f"❌ 元数据文件不存在: {metadata_file}\n"
+                f"💡 请先运行 'python preprocess.py' 进行数据预处理"
+            )
+        
+        with open(metadata_file, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+        
+        vocab_info = {
+            'vocab_size': metadata['vocab_size'],
+            'special_tokens': metadata['special_tokens'],
+            'bpe_model_path': metadata['bpe_model_path'],
+            'max_seq_len': metadata['max_seq_len']
+        }
+        
+        logger.info(f"✅ 词汇表信息获取成功: {vocab_info['vocab_size']:,} tokens")
+        return vocab_info
+        
+    except Exception as e:
+        logger.error(f"❌ 词汇表信息获取失败: {str(e)}")
+        raise RuntimeError(f"词汇表信息获取失败: {str(e)}")
+
+def verify_data_integrity() -> bool:
+    """
+    验证数据完整性
+    
+    Returns:
+        bool: 数据是否完整
+    """
+    logger.info("🔍 验证数据完整性...")
+    
+    try:
+        # 检查必要文件
+        prepared_data_dir = Path(config.PREPARED_DATA_DIR)
+        
+        required_files = [
+            prepared_data_dir / "metadata.json",
+            prepared_data_dir / f"{config.BPE_MODEL_PREFIX}.model"
+        ]
+        
+        required_dirs = [
+            prepared_data_dir / "train_chunks",
+            prepared_data_dir / "validation_chunks",
+            prepared_data_dir / "test_chunks"
+        ]
+        
+        # 检查文件
+        for file_path in required_files:
+            if not file_path.exists():
+                logger.error(f"❌ 缺少必要文件: {file_path}")
+                return False
+        
+        # 检查目录
+        for dir_path in required_dirs:
+            if not dir_path.exists():
+                logger.error(f"❌ 缺少必要目录: {dir_path}")
+                return False
+            
+            # 检查分块文件
+            chunk_files = list(dir_path.glob("chunk_*.pt"))
+            if not chunk_files:
+                logger.error(f"❌ 目录为空: {dir_path}")
+                return False
+        
+        # 尝试创建数据加载器
+        try:
+            train_loader, valid_loader, test_loader = create_data_loaders()
+            
+            # 测试加载一个批次
+            test_batch = next(iter(train_loader))
+            
+            logger.info(f"✅ 数据完整性验证通过")
+            logger.info(f"📊 测试批次形状:")
+            logger.info(f"  src: {test_batch['src'].shape}")
+            logger.info(f"  tgt_input: {test_batch['tgt_input'].shape}")
+            logger.info(f"  tgt_output: {test_batch['tgt_output'].shape}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ 数据加载测试失败: {str(e)}")
+            return False
+        
+    except Exception as e:
+        logger.error(f"❌ 数据完整性验证失败: {str(e)}")
+        return False
+
+def main():
+    """主函数 - 用于测试数据加载器"""
+    print("🚀 WMT14数据加载器测试 - 项目宪法实现")
+    print("="*80)
+    
+    try:
+        # 验证数据完整性
+        if not verify_data_integrity():
+            print("❌ 数据完整性验证失败")
+            print("💡 请先运行 'python preprocess.py' 进行数据预处理")
+            return
+        
+        # 获取词汇表信息
+        vocab_info = get_vocab_info()
+        print(f"📊 词汇表大小: {vocab_info['vocab_size']:,}")
+        
+        # 创建数据加载器
+        train_loader, valid_loader, test_loader = create_data_loaders()
+        
+        # 测试数据加载
+        print("\n🧪 测试数据加载...")
+        for i, batch in enumerate(train_loader):
+            if i >= 3:  # 只测试前3个批次
+                break
+            
+            print(f"批次 {i+1}:")
+            print(f"  src: {batch['src'].shape} | 非零元素: {(batch['src'] != config.PAD_IDX).sum().item()}")
+            print(f"  tgt_input: {batch['tgt_input'].shape} | 非零元素: {(batch['tgt_input'] != config.PAD_IDX).sum().item()}")
+            print(f"  tgt_output: {batch['tgt_output'].shape} | 非零元素: {(batch['tgt_output'] != config.PAD_IDX).sum().item()}")
+        
+        print("\n✅ 数据加载器测试完成!")
+        print("🎯 现在可以运行 'python train.py' 开始训练")
+        
+    except Exception as e:
+        print(f"❌ 测试失败: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    main()
