@@ -9,9 +9,9 @@ import os
 # 第一章：核心原则配置
 # =============================================================================
 
-# --- 1. 硬件配置 (RTX 4060 8GB 适配) ---
+# --- 1. 硬件配置 (RTX 5090 32GB 适配) ---
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-MAX_GPU_MEMORY_GB = 8  # RTX 4060显存限制
+MAX_GPU_MEMORY_GB = 32  # RTX 5090显存限制
 
 # --- 2. WMT14数据集配置 (绝对忠于原文精神) ---
 # 使用Hugging Face datasets库自动下载WMT14
@@ -22,8 +22,8 @@ TGT_LANGUAGE = 'en'  # 英语
 
 # 数据路径配置 - 使用Hugging Face缓存的WMT14数据
 USE_HUGGINGFACE_DATASETS = True  # 使用HF datasets而非本地文件
-RAW_DATA_DIR = "/home/patric/.cache/huggingface/datasets/wmt14/de-en/0.0.0/b199e406369ec1b7634206d3ded5ba45de2fe696"  # 使用Hugging Face缓存的WMT14数据
-HUGGINGFACE_CACHE_DIR = "/home/patric/.cache/huggingface/datasets"  # Hugging Face缓存目录
+RAW_DATA_DIR = None  # 自动使用Hugging Face默认缓存路径
+HUGGINGFACE_CACHE_DIR = None  # 自动使用Hugging Face默认缓存路径
 PREPARED_DATA_DIR = "data_bpe_original"  # BPE处理后的数据
 CHECKPOINTS_DIR = "checkpoints"
 LOGS_DIR = "logs"
@@ -57,7 +57,7 @@ PAD_TOKEN = '<pad>'
 # 第二章：模型架构配置 ("Base Model" from Paper)
 # =============================================================================
 
-# --- Transformer Base Model 配置 (严格遵循论文65M参数) ---
+# --- Transformer Base Model 配置 (RTX 5090优化版) ---
 D_MODEL = 512              # 模型维度 (论文标准)
 NUM_ENCODER_LAYERS = 6     # 编码器层数 (论文标准)
 NUM_DECODER_LAYERS = 6     # 解码器层数 (论文标准)
@@ -65,7 +65,7 @@ NHEAD = 8                  # 多头注意力头数 (论文标准)
 DIM_FEEDFORWARD = 2048     # 前馈网络维度 (论文标准)
 D_FF = 2048                # 前馈网络维度 (别名，与DIM_FEEDFORWARD相同)
 DROPOUT = 0.1              # Dropout率 (论文标准)
-MAX_SEQ_LEN = 256         # 最大序列长度 (增加以匹配论文，适当平衡显存)
+MAX_SEQ_LEN = 512          # 最大序列长度 (RTX 5090可支持更长序列)
 
 # --- 权重初始化配置 ---
 XAVIER_UNIFORM_GAIN = 1.0
@@ -76,11 +76,11 @@ SHARE_EMBEDDINGS = False  # 不共享嵌入权重以达到65M参数（原文标�
 # 第三章：训练配置 (8GB GPU适配 + 论文忠实)
 # =============================================================================
 
-# --- 批次配置 (在安全范围内最大化物理批次) ---
-BATCH_SIZE_TOKENS = 512  # 动态批处理：每批次目标token数 (终极攻击版)
-MAX_BATCH_SIZE = 32        # 固定批次大小的上限 (主要用于测试集)
-GRADIENT_ACCUMULATION_STEPS = 24   # 梯度累积步数 (终极攻击版)
-EFFECTIVE_BATCH_SIZE = BATCH_SIZE_TOKENS * GRADIENT_ACCUMULATION_STEPS  # 24576 tokens (保持不变!)
+# --- 批次配置 (RTX 5090大显存优化) ---
+BATCH_SIZE_TOKENS = 4096   # 动态批处理：每批次目标token数 (RTX 5090优化)
+MAX_BATCH_SIZE = 128       # 固定批次大小的上限 (RTX 5090可支持更大批次)
+GRADIENT_ACCUMULATION_STEPS = 8    # 梯度累积步数 (减少累积，增加物理批次)
+EFFECTIVE_BATCH_SIZE = BATCH_SIZE_TOKENS * GRADIENT_ACCUMULATION_STEPS  # 32768 tokens (更大有效批次)
 
 # 动态批处理配置
 USE_DYNAMIC_BATCHING = True  # 启用动态批处理
@@ -104,13 +104,13 @@ LEARNING_RATE_SCALE = 0.7  # 学习率缩放因子
 LABEL_SMOOTHING_EPS = 0.1   # 论文标准标签平滑系数
 GRADIENT_CLIP_NORM = 1.0    # 梯度裁剪阈值
 
-# --- 训练步数与验证频率 (目标导向) ---
+# --- 训练步数与验证频率 (RTX 5090优化) ---
 TRAIN_STEPS = TOTAL_LOGICAL_STEPS * GRADIENT_ACCUMULATION_STEPS  # 约 800,000 物理步
-VALIDATE_EVERY_STEPS = 500
-VALIDATE_EVERY_LOGICAL_STEPS = 2000  # 每2000次逻辑更新验证一次
-LOG_EVERY_LOGICAL_STEPS = 200        # 每200次逻辑更新输出loss
-BLEU_EVAL_EVERY_LOGICAL_STEPS = 2000 # 每2000次逻辑更新输出BLEU
-SAVE_EVERY_LOGICAL_STEPS = 5000      # 检查点保存频率（逻辑步）
+VALIDATE_EVERY_STEPS = 200   # 更频繁验证（物理步）
+VALIDATE_EVERY_LOGICAL_STEPS = 1000  # 每1000次逻辑更新验证一次
+LOG_EVERY_LOGICAL_STEPS = 100        # 每100次逻辑更新输出loss
+BLEU_EVAL_EVERY_LOGICAL_STEPS = 1000 # 每1000次逻辑更新输出BLEU
+SAVE_EVERY_LOGICAL_STEPS = 2500      # 检查点保存频率（逻辑步）
 
 # --- 早停配置 (务实且耐心) ---
 EARLY_STOPPING_PATIENCE = 10  # 连续10次验证无提升则停止
@@ -160,9 +160,9 @@ CUDNN_DETERMINISTIC = True
 CUDNN_BENCHMARK = False
 
 # --- 内存优化配置 ---
-EMPTY_CACHE_EVERY_N_STEPS = 1000  # 每N步清空CUDA缓存
+EMPTY_CACHE_EVERY_N_STEPS = 500   # 每N步清空CUDA缓存（RTX 5090更频繁清理）
 PIN_MEMORY = True          # 数据加载器pin_memory
-NUM_WORKERS = 16            # WSL2优化：使用16个worker
+NUM_WORKERS = 8            # 服务器优化：使用8个worker（避免过多进程）
 
 # =============================================================================
 # 第六章：路径配置 (文件系统组织)
